@@ -1,0 +1,13 @@
+# Ignore configuration files that may contain sensitive information.
+
+
+# Ignore paths that contain user-generated content.
+
+
+# Ignore Eclipse-generated project artifacts
+.DS_Store
+
+
+
+
+#Ignore database sql dumps

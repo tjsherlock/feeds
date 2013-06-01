@@ -1,0 +1,1162 @@
+<?php
+// $Id$
+
+
+
+
+
+/**
+ * @file
+ *  Grabs image for each feed-item from their respective web pages and stores
+ *  it in an image field. Requires Feeds module.
+ *
+ *
+ *  Thomas J. Sherlock custom code for plugin 2012 May 1
+ *
+ *
+ */
+
+//=============
+//DRUPAL HOOKS.
+//=============
+
+/**
+ * Implements hook_menu().
+().
+ */
+function feeds_imagegrabber_menu() {
+  $items = array();
+  $items['admin/config/feeds_imagegrabber'] = array(
+    'title' => 'Feeds Image Grabber',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('feeds_imagegrabber_admin'),
+    'access arguments' => array('administer site configuration'),
+    'description' => 'Configure default options for Feeds Image Grabber',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function feeds_imagegrabber_form_node_form_alter(&$form, $form_state) {
+  if ($importer_id = feeds_get_importer_id($form['#node']->type)) {
+    // Use the values from $form_state if available
+    if (isset($form_state['values']['feeds_imagegrabber'])) {
+      $settings = $form_state['values']['feeds_imagegrabber'];
+    }
+    elseif (!isset($form['#node']->nid) || ($settings = feeds_imagegrabber_get_settings($form['#node']->nid)) === FALSE) {
+      $settings = feeds_imagegrabber_get_default_settings();
+    }
+
+    $form['feeds_imagegrabber'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Feeds Image Grabber'),
+      '#tree' => TRUE,
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+
+    feeds_imagegrabber_form($form, $settings);
+
+    $form['#validate'][] = 'feeds_imagegrabber_form_validate';
+  }
+}
+
+/**
+ * Validates the feeds_imagegrabber form of the node.
+ */
+function feeds_imagegrabber_form_validate($form, &$form_state) {
+  if ($form_state['values']['feeds_imagegrabber']['enabled'] == 1) {
+    $id_class = $form_state['values']['feeds_imagegrabber']['id_class'];
+    $id_class_desc = $form_state['values']['feeds_imagegrabber']['id_class_desc'];
+    if ($id_class) {
+      if (!isset($id_class_desc) || empty($id_class_desc) || $id_class_desc == '') {
+        form_set_error('feeds_imagegrabber][id_class_desc', "Specify the id/class of the desired tag.");
+      }
+      if ($id_class == 1 && !preg_match('/^[a-zA-Z]+[_a-zA-Z0-9-]*$/', $id_class_desc)) {
+        form_set_error('feeds_imagegrabber][id_class_desc', "Only alphabets, digits, hyphens and underscores are allowed in HTML id");
+      }
+      elseif ($id_class == 2 && !preg_match('/^[a-zA-Z]+[_a-zA-Z0-9- ]*$/', $id_class_desc)) {
+        form_set_error('feeds_imagegrabber][id_class_desc', "Only alphabets, digits, hyphens, spaces and underscores are allowed in HTML class");
+      }
+    }
+    else {
+      form_set_value($form['feeds_imagegrabber']['id_class_desc'], '', $form_state);
+    }
+    $temp = $form_state['values']['feeds_imagegrabber']['exec_time'];
+    if (!is_numeric($temp) || $temp < 10 || $temp != round($temp) || $temp > 75) {
+      form_set_error('feeds_imagegrabber][exec_time', t('Select the correct option for FIG execution time.'));
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function feeds_imagegrabber_node_insert($node) {
+  feeds_imagegrabber_node_update($node);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function feeds_imagegrabber_node_update($node) {
+  if ($importer_id = feeds_get_importer_id($node->type)) {
+    if ($node->feeds_imagegrabber['enabled']) {
+      $settings = array(
+        'enabled' => $node->feeds_imagegrabber['enabled'],
+        'id_class' => $node->feeds_imagegrabber['id_class'],
+        'id_class_desc' => $node->feeds_imagegrabber['id_class_desc'],
+        'exec_time' => $node->feeds_imagegrabber['exec_time'],
+        'feeling_lucky' => $node->feeds_imagegrabber['feeling_lucky'],
+      );
+      
+      db_merge('feeds_imagegrabber')
+        ->key(array('feed_nid' => $node->nid))
+        ->fields($settings)
+        ->execute();
+    }
+    else {
+      db_update('feeds_imagegrabber')
+        ->fields(array('enabled' => 0))
+        ->condition('feed_nid', $node->nid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function feeds_imagegrabber_node_delete($node) {
+  @db_query("DELETE FROM {feeds_imagegrabber} where feed_nid = %d", $node->nid);
+}
+
+//==================
+// FEEDS HOOKS
+//==================
+
+/**
+ * Implements hook_feeds_processor_targets_alter().
+ *
+ * @see FeedsNodeProcessor::getMappingTargets().
+ */
+function feeds_imagegrabber_feeds_processor_targets_alter(&$targets, $entity_type, $bundle_name) {
+  foreach (field_info_instances($entity_type, $bundle_name) as $name => $instance) {
+    $info = field_info_field($name);
+    if (in_array($info['type'], array('image'))) {
+      $targets[$name . ':fig'] = array(
+        'name' => check_plain($instance['label']) . ' (FIG)',
+        'callback' => 'feeds_imagegrabber_feeds_set_target',
+        'description' => t('The @label field of the node.', array('@label' => $instance['label'])),
+      );
+    }
+    if (in_array($info['type'], array('video_embed_field'))) {//tjs 2012Jan04
+    	$targets[$name . ':fvg'] = array(
+    			'name' => check_plain($instance['label']) . ' (FVG)',
+    			'callback' => 'my_module_set_target',
+    			'description' => t('The @label field of the node.', array('@label' => $instance['label'])),
+    	);
+    }
+  }
+}
+
+/**
+ * Callback for mapping. Here is where the actual mapping happens.
+ */
+function feeds_imagegrabber_feeds_set_target($source, $entity, $target, $page_url) {
+  if (empty($page_url)) {
+    return;
+  }
+
+  
+  $feed_nid     = $entity->feeds_item->feed_nid;
+  $settings     = feeds_imagegrabber_get_settings($feed_nid);
+  
+  if(!$settings || !$settings['enabled']) {
+    return FALSE;
+  }
+  
+  if (!feeds_imagegrabber_include_library('url_to_absolute.inc', 'feeds_imagegrabber')) {
+    watchdog('feeds_imagegrabber', 'url conversion script is missing. ', array(), WATCHDOG_ERROR, 'admin/reports/dblog/feeds_imagegrabber');
+    return FALSE;
+  }
+  
+  //list($field_name) = split(':', $target);//deprecated in PHP5.3
+  list($field_name) = explode(':', $target);
+  
+  list($entity_id, $vid, $bundle_name) = entity_extract_ids($entity->feeds_item->entity_type, $entity);
+  $instance_info = field_info_instance($entity->feeds_item->entity_type, $field_name, $bundle_name);
+  $info = field_info_field($field_name);
+  
+  $max_filesize = parse_size(file_upload_max_size());
+  if (!empty($instance_info['settings']['max_filesize']) && parse_size($instance_info['settings']['max_filesize']) < $max_filesize) {
+    $max_filesize = parse_size($instance_info['settings']['max_filesize']);
+  }
+  
+  $max_exec_time = ini_get('max_execution_time');
+  $timeout = $max_exec_time == 0 ? 10 : ($settings['exec_time'] * $max_exec_time / 100);
+  $page_time = timer_read('page')/1000;
+  if(function_exists('encode_url')) {
+    $page_url = encode_url($page_url);
+  }
+  
+  if (valid_url($page_url)) {
+    $xml = feeds_imagegrabber_webpage_scraper($page_url, $settings['id_class'], $settings['id_class_desc'], $timeout);
+    if ($xml == FALSE) {
+      return;
+    }
+    $timeout = $timeout - timer_read('page')/1000 + $page_time;
+  
+    $options = array(
+      'max_imagesize' => $max_filesize,
+      'timeout' => $timeout,
+      'feeling_lucky' => $settings['feeling_lucky'],
+      'cardinality' => $info['cardinality'],
+    );
+
+    $images = feeds_imagegrabber_scrape_images($xml, $page_url, $options);
+    if ($images == FALSE || count($images) <= 0) {
+      return;
+    }
+
+    asort($images);
+    $images = array_reverse($images, TRUE);
+    
+    $data = array();
+    if (!empty($entity->uid)) {
+      $data[$entity->feeds_item->entity_type] = $entity;
+    }
+    
+    $field = isset($entity->$field_name) ? $entity->$field_name : array();
+    $target_dir = file_field_widget_uri($info, $instance_info, $data); 
+    
+    $image_count = 0;
+    foreach ($images as $url => $size) {
+      $enclosure = new FeedsEnclosure($url, 'application/octet-stream');
+      if (($file = $enclosure->getFile($target_dir)) && ($file = feeds_imagegrabber_is_image($file)) && !count(feeds_imagegrabber_widget_file_validator($file, $instance_info))) {
+        $field['und'][$image_count] = (array)$file;
+        $field['und'][$image_count]['display'] = 1;
+        
+        /*if($image_count == ($info['cardinality'])) {
+          break;
+        }*/
+      }
+      
+      $entity->$field_name = $field;
+      
+      /**if($image_count == ($info['cardinality'] -1)) {//tjs 2012Jan24  moved.
+      	break;
+      }*/
+      //$entity->$field_name[] = $field;
+      $image_count++;//Added to get all images per article (feed item) tjs 2012Jan26
+    }
+  }
+}
+
+//==================
+//HELPER FUNCTIONS
+//==================
+
+/**
+ * Retrieve settings for a feed node from the database.
+ *
+ * @param $feed_nid
+ *   The nid of the feed node.
+ *
+ * @return
+ *   An array of settings or FALSE if settings not found.
+ *
+ */
+function feeds_imagegrabber_get_settings($feed_nid) {
+  $settings = db_query("SELECT enabled, id_class, id_class_desc, feeling_lucky, exec_time FROM {feeds_imagegrabber} WHERE feed_nid = :feed_nid", array(':feed_nid' => $feed_nid))->fetchAssoc();
+  return $settings;
+}
+
+/**
+ * Retrieve the default settings for a feed node from the database.
+ *
+ * @return
+ *   An array of settings.
+ *
+ */
+function feeds_imagegrabber_get_default_settings() {
+  $default = array(
+    'enabled' => 0,
+    'id_class' => 0,
+    'id_class_desc' => '',
+    'exec_time' => 10,
+    'feeling_lucky' => 0,
+  );
+
+  return variable_get('feeds_imagegrabber', $default);
+}
+
+/**
+ * Implementation of the default settings admin form.
+ */
+function feeds_imagegrabber_admin($form, &$form_state) {
+  $form = array();
+  $settings = feeds_imagegrabber_get_default_settings();
+
+  $form['feeds_imagegrabber'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Default Settings'),
+    '#tree' => TRUE,
+    '#collapsible' => FALSE,
+  );
+
+  feeds_imagegrabber_form($form, $settings);
+  $form['#validate'][] = 'feeds_imagegrabber_form_validate';
+
+  return system_settings_form($form);
+}
+
+/**
+ * Appends the form with the Feeds Image Grabber form using the
+ * passed default settings.
+ *
+ * @param &$form
+ *   The form to append under the 'feeds_imagegrabber' fieldset.
+ * @param $default_settings
+ *   The default values of the form elements.
+ */
+function feeds_imagegrabber_form(&$form, $default_settings) {
+  $form['feeds_imagegrabber']['enabled'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable Feeds Image Grabber'),
+    '#description' => t('Check if you want to download images from URL of the feed items.'),
+    '#default_value' => $default_settings['enabled'],
+  );
+
+  $form['feeds_imagegrabber']['id_class'] = array(
+    '#type' => 'radios',
+    '#title' => t('Search for the images between the tag which is identified by'),
+    '#options' => array(
+      t('None, search the whole web-page for the images.'),
+      t('an Id'),
+      t('a Class'),
+    ),
+    '#default_value' => $default_settings['id_class'],
+  );
+
+  $form['feeds_imagegrabber']['id_class_desc'] = array(
+    '#type' => 'textfield',
+    '#title' => t('<i>Id</i> or <i>Class</i> of the HTML tag (Leave empty if you selected <i>None</i> above.)'),
+    '#default_value' => $default_settings['id_class_desc'],
+    '#description' => t('Separate multiple classes with spaces (as present in the HTML)'),
+    '#maxlength' => 100,
+  );
+
+  $form['feeds_imagegrabber']['feeling_lucky'] = array(
+    '#type' => 'radios',
+    '#title' => t('Feeling lucky, huh?'),
+    '#options' => array(
+      t('No, select the images based of their size (large to small) between the tag.'),
+      t('Yes, select the images based on their position (top to bottom) between the tag. (Recommended)'),
+    ),
+    '#default_value' => $default_settings['feeling_lucky'],
+  );
+  $form['feeds_imagegrabber']['exec_time'] = array(
+    '#type' => 'select',
+    '#title' => t('Execution time[%]'),
+    '#options' => drupal_map_assoc(array(10, 20, 30, 50, 75)),
+    '#default_value' => $default_settings['exec_time'],
+    '#description' => t('Select the percentage of maximum PHP execution time to take while grabbing images for a feed item.'),
+  );
+}
+
+/**
+ * Validates the size of an file accessible through a http url.
+ *
+ * @param $file_url
+ *   A string specifying the formatted file url.
+ * @param $max_size
+ *   Maximum size of the file to be downloaded.
+ * @param $timeout
+ *   A float representing the maximum number of seconds the function call
+ *   may take. The default is 10 seconds. If a timeout occurs, the retuen
+ *   code is set to the HTTP_REQUEST_TIMEOUT constant.
+ * @param $max_redirects
+ *   An integer representing how many times a redirect may be followed.
+ *   Defaults to 3.
+ *
+ * @return
+ *   An integer code containing filesize in case the file exists and conforms to the
+ *   size limit, -1 otherwise.
+ *
+ */
+function feeds_imagegrabber_validate_download_size($file_url, $max_size, $timeout = 10, $max_redirects = 3) {
+  $options = array(
+    'headers' => array(),
+    'method' => 'HEAD',
+    'data' => NULL,
+    'max_redirects' => $max_redirects,
+    'timeout' => $timeout,
+  );
+  $result = drupal_http_request($file_url, $options);
+
+  if ($result->code == 200 && isset($result->headers) && is_array($result->headers)) {
+    //Bug #882992, some servers may return keys with different case.
+    $headers = array_change_key_case($result->headers);
+
+    if (isset($headers['content-length']) && $headers['content-length'] <= $max_size) {
+      return $headers['content-length'];
+    }
+  }
+  return -1;
+}
+
+/**
+ * Scrape the webpage using the id or the css class of a tag and returns the
+ * HTML between the tag.
+ *
+ * @param $page_url
+ *   A string specifying the page url to scrape. If there is a redirect, it is
+ *   changed to the redirect_url.
+ * @param $itype
+ *   A positive integer value representing the identifier type for the tag:
+ *     - 0 : selects content between <body> </body>.
+ *     - 1 : selects content between the tag identified by an ID.
+ *     - 2 : selects content between the first tag identified by a CSS class.
+ * @param $ivalue
+ *   A string specifying the ID or the CSS class.
+ * @param $timeout
+ *   A float representing the maximum number of seconds the function call
+ *   may take. The default is 15 seconds. If a timeout occurs, the retuen
+ *   code is set to the HTTP_REQUEST_TIMEOUT constant.
+ * @param $max_redirects
+ *   An integer representing how many times a redirect may be followed.
+ *   Defaults to 3.
+ * @param $error_log
+ *   An array which contains the error codes and messages in case the functions fails.
+ *
+ * @return
+ *   FALSE on failure, OR content between the tags as XML on success
+ *
+ */
+function feeds_imagegrabber_webpage_scraper(&$page_url, $itype, $ivalue = '', $timeout = 15, $max_redirects = 3, &$error_log = array()) {
+  $options = array(
+    'headers' => array(),
+    'method' => 'GET',
+    'data' => NULL,
+    'max_redirects' => $max_redirects,
+    'timeout' => $timeout,
+  );
+
+  
+  $result = drupal_http_request($page_url, $options);
+  if (in_array($result->redirect_code, array(301, 302, 307))) {
+    $page_url = $result->redirect_url;
+  }
+
+  if ($result->code != 200) {
+    $error_log['code'] = $result->code;
+    $error_log['error'] = "unable to retrieve content from web page";
+    return FALSE;
+  }
+  if (empty($result->data) || drupal_strlen($result->data) <= 0) {
+    $error_log['code'] = -1;
+    $error_log['error'] = "no data available on url";
+    return FALSE;
+  }
+
+  $doc = new DOMDocument();
+  if (@$doc->loadHTML($result->data) === FALSE) {
+    $error_log['code'] = -2;
+    $error_log['error'] = "unable to parse the html content";
+    return FALSE;
+  }
+
+  if ($itype == 0) {
+    $items = @$doc->getElementsByTagName("body");
+    if ($items != NULL && $items->length > 0) {
+      $dist = $items->item(0);
+    }
+    else {
+      $dist = NULL;
+    }
+  }
+  elseif ($itype == 1) {
+    $dist = @$doc->getElementById($ivalue);
+  }
+  elseif ($itype == 2) {
+    $xpath = new DOMXPath($doc);
+    //Normalize whitespaces.
+    $ivalue = preg_replace('/\s\s+/', ' ', trim($ivalue));
+    $items = $xpath->query("//*[@class and contains(concat(' ',normalize-space(@class),' '), ' $ivalue ')]");
+    if ($items != NULL && $items->length > 0) {
+      $dist = $items->item(0);
+    }
+    else {
+      $dist = NULL;
+    }
+  }
+  else {
+    //not supported yet
+    $dist = NULL;
+  }
+
+  if ($dist == NULL) {
+    $error_log['code'] = -3;
+    $error_log['error'] = "tag not found";
+    return FALSE;
+  }
+  $content = '';
+ 
+  
+  if (($content = @$dist->ownerDocument->saveXML($dist)) === FALSE) {
+    $error_log['code'] = -4;
+    $error_log['error'] = "error converting content to XML";
+    return FALSE;
+  }
+
+  return $content;
+}
+
+/**
+ * Scrape images from HTML/XML content.
+ */
+function feeds_imagegrabber_scrape_images($content, $base_url, array $options = array(), &$error_log = array()) {
+
+  // Merge the default options.
+  $options += array(
+    'expression' => "//img",
+    'getsize' => TRUE,
+    'max_imagesize' => 512000,
+    'timeout' => 10,
+    'max_redirects' => 3,
+    'feeling_lucky' => 0,
+    'cardinality' => 1,
+  );
+
+  $doc = new DOMDocument();
+  if (@$doc->loadXML($content) === FALSE && @$doc->loadHTML($content) === FALSE) {
+    $error_log['code'] = -5;
+    $error_log['error'] = "unable to parse the xml//html content";
+    return FALSE;
+  }
+
+  $xpath = new DOMXPath($doc);
+  $hrefs = @$xpath->evaluate($options['expression']);
+
+  if ($options['getsize']) {
+    timer_start(__FUNCTION__);
+  }
+
+  $images = array();
+  $imagesize = 0;
+  $hrefs_length = $hrefs->length;
+  for ($i = 0; $i < $hrefs->length; $i++) {
+    $url = $hrefs->item($i)->getAttribute('src');
+    if (!isset($url) || empty($url) || $url == '') {
+      continue;
+    }
+    if (function_exists('encode_url')) {
+      $url = encode_url($url);
+    }
+    
+    if(function_exists('url_to_absolute')){
+      $url = url_to_absolute($base_url, $url);
+    }
+    
+    if ($url == FALSE) {
+      continue;
+    }
+
+    if ($options['getsize']) {
+      if (($imagesize = feeds_imagegrabber_validate_download_size($url, $options['max_imagesize'], ($options['timeout'] - timer_read(__FUNCTION__) / 1000))) != -1) {
+        $images[$url] = $imagesize;
+        if ($settings['feeling_lucky'] && count($images) == $settings['cardinality']) {
+          break;
+        }
+      }
+      if (($options['timeout'] - timer_read(__FUNCTION__) / 1000) <= 0) {
+        $error_log['code'] = HTTP_REQUEST_TIMEOUT;
+        $error_log['error'] = "timeout occured while scraping the content";
+        break;
+      }
+    }
+    else {
+      $images[$url] = $imagesize;
+      if ($settings['feeling_lucky'] && count($images) == $settings['cardinality']) {
+        break;
+      }
+    }
+  }
+
+  return $images;
+}
+
+/**
+ * Checks that a file is an image.
+ *
+ * This check allows the image formats identified by drupal i.e. jpeg, png
+ * and gif. If the filename is missing an extension but is a valid image,
+ * its actual extension is added to it and the original file is renamed.
+ *
+ * @param $file
+ *   The file object.
+ *
+ * @return
+ *   The final file object, it may be modified or FALSE on failure.
+ */
+function feeds_imagegrabber_is_image(&$file) {
+  $extensions = 'jpeg jpg png gif';
+ 
+  if ($file && $filepath = $file->uri) {
+    $info = feeds_imagegrabber_get_image_info($filepath);
+    if ($info && !empty($info['extension'])) {
+      if (!count(file_validate_extensions($file, $extensions))) {
+        return $file;
+      }
+      else {
+        $basename = basename($filepath);
+        $directory = drupal_dirname($filepath);
+        
+        if ($pos = strrpos($basename, '.')) {
+          $name = substr($basename, 0, $pos);
+          $ext = substr($basename, $pos);
+
+          $regex = '/\.(' . preg_replace('/ +/', '|', preg_quote($extensions)) . ')/i';
+          if (preg_match($regex, $ext, $matches)) {
+            $ext = $matches[1];
+          }
+          else {
+            $ext = $info['extension'];
+          }
+          $basename = $name . '.' . $ext;
+        }
+        else {
+          $basename .= '.' . $info['extension'];
+        }
+
+        if ($basename == basename($filepath)) {
+          return $file;
+        }
+
+        $dest = file_create_filename($basename, $directory);
+        if ($file = file_move($file, $dest)) {
+          return $file;
+        }
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Drupal only supports GIF, JPG and PNG file formats.
+ * (Mostly from drupal's image_get_info() expect the file 
+ * need not be an uploaded one)
+ *
+ * @return
+ *   FALSE, if the file could not be found or is not an image. Otherwise, a
+ *   keyed array containing information about the image:
+ *    'width'     - Width in pixels.
+ *    'height'    - Height in pixels.
+ *    'extension' - Commonly used file extension for the image.
+ *    'mime_type' - MIME type ('image/jpeg', 'image/gif', 'image/png').
+ */
+function feeds_imagegrabber_get_image_info($file) {
+  if (!is_file($file)) {
+    return FALSE;
+  }
+
+  $details = FALSE;
+  $data = @getimagesize($file);
+  if (isset($data) && is_array($data)) {
+    $extensions = array(
+      '1' => 'gif',
+      '2' => 'jpg',
+      '3' => 'png',
+    );
+    $extension = array_key_exists($data[2], $extensions) ?   $extensions[$data[2]] : '';
+    
+    //tjs 2012Feb17
+    if($data[0] < 204){
+    	
+    $onethirdwidth = round($data[0] * .3);	
+    $data[0]+= $onethirdwidth;
+
+    $onethirdheight = round($data[1] * .3);
+    $data[1]+= $onethirdheight;
+    
+    }
+    
+    //width="116" height="95"
+    $data[3] = 'width="'. $data[0]. '" height="'. $data[1] . '"';
+    //$data[3] = 'width="{$data[0]}" height="{$data[1]}"';
+    
+    $details = array(
+      'width' => $data[0],
+      'height' => $data[1],
+      'extension' => $extension,
+      'mime_type' => $data['mime'],
+    );
+  }
+
+  return $details;
+}
+
+/**
+ * Includes a required library file.
+ *
+ * @param $file
+ *   The filename to load from.
+ * @param $library
+ *   The name of the library. If libraries module is installed,
+ *   feeds_imagegrabber_include_library() will look for libraries
+ *   with this name managed by libraries module.
+ */
+function feeds_imagegrabber_include_library($file, $library) {
+  if (module_exists('libraries') && file_exists(libraries_get_path($library) . "/$file")) {
+    require_once DRUPAL_ROOT . '/' . libraries_get_path($library) . "/$file";
+    return TRUE;
+  }
+  else {
+    $paths = array(
+      drupal_get_path('module', 'feeds_imagegrabber'),
+      drupal_get_path('module', 'feeds_imagegrabber') . "/libraries",
+      'sites/all/libraries',
+      'sites/all/libraries/feeds_imagegrabber',
+      'sites/all/libraries/absoluteurl',
+      'sites/all/libraries/AbsoluteUrl',
+    );
+    foreach ($paths as $library_path) {
+      $path = $library_path . "/$file";
+      if (file_exists($path)) {
+        require_once DRUPAL_ROOT . '/' . $path;
+        return TRUE;
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Validate the file object with field instance specific validators
+ *
+ * @param $file
+ *   The file object to be validated.
+ * @param $instance
+ *   The instance info of the image field.
+ *
+ * @return
+ *   An array containing the errors (if any) which occurs
+ *   while running the validators.
+ */
+function feeds_imagegrabber_widget_file_validator($file, $instance) {
+  $settings = $instance['settings'];
+  // Create the list of validators.
+  $image_validators = array();
+  $image_validators['file_validate_name_length'] = array();
+  if ($settings['max_resolution'] || $settings['min_resolution']) {
+    $image_validators['file_validate_image_resolution'] = array($settings['max_resolution'], $settings['min_resolution']);
+  }
+  $file_validators = file_field_widget_upload_validators(NULL, $instance);
+  $validators = array_merge($file_validators, $image_validators);
+  
+  $errors = file_validate($file, $validators);
+  
+  return $errors;
+}
+
+
+
+
+/**
+ * tjs 2012Jan03
+ * 
+ * Alter mapping sources.
+ *
+ * Use this hook to add additional mapping sources for any parser. Allows for
+ * registering a callback to be invoked at mapping time.
+ *
+ * @see my_source_get_source().
+ * @see locale_feeds_parser_sources_alter().
+ */
+function feeds_imagegrabber_feeds_parser_sources_alter(&$sources, $content_type) {
+  $sources['dc_source'] = array(
+    'name' => t('Source of article or video'),
+    'description' => t('Article or video occuring in the source element of a feed item.'),
+    'callback' => 'my_source_get_source',
+  );
+}
+
+/**
+ * Example callback specified in hook_feeds_parser_sources_alter().
+ *
+ * To be invoked on mapping time.
+ *
+ * @param $source
+ *   The FeedsSource object being imported.
+ * @param $result
+ *   The FeedsParserResult object being mapped from.
+ * @param $key
+ *   The key specified in the $sources array in
+ *   hook_feeds_parser_sources_alter().
+ *
+ * @return
+ *   The value to be extracted from the source.
+ *
+ * @see hook_feeds_parser_sources_alter().
+ * @see locale_feeds_get_source().
+ */
+/*function my_source_get_source($source, FeedsParserResult $result, $key) {
+  $item = $result->currentItem();
+  return my_source_parse_images($item['description']);
+}*/
+
+
+
+/**
+ * tjs 2012Jan03
+ * 
+ * Get an element identified by $element_key of the given item.
+ * The element key corresponds to the values in the array returned by
+ * FeedsParser::getMappingSources().
+ *
+ * This method is invoked from FeedsProcessor::map() when a concrete item is
+ * processed.
+ *
+ * @ingroup mappingapi
+ *
+ * @param $batch
+ *   FeedsImportBatch object containing the sources to be mapped from.
+ * @param $element_key
+ *   The key identifying the element that should be retrieved from $source
+ *
+ * @return
+ *   The source element from $item identified by $element_key.
+ *
+ * @see FeedsProcessor::map()
+ * @see FeedsCSVParser::getSourceElement().
+ */
+function my_source_get_source(FeedsSource $source, FeedsParserResult $result, $element_key) {
+//public function getSourceElement(FeedsSource $source, FeedsParserResult $result, $element_key) {
+	if ($element_key == 'parent:uid' &&
+			$source->feed_nid &&
+			($node = node_load($source->feed_nid))) {
+		return $node->uid;
+	}
+	$item = $result->currentItem();
+	return isset($item[$element_key]) ? $item[$element_key] : '';
+}
+
+
+
+
+
+
+
+/**
+ * Alter mapping targets for entities. Use this hook to add additional target
+ * options to the mapping form of Node processors.
+ *
+ * If the key in $targets[] does not correspond to the actual key on the node
+ * object ($node->key), real_target MUST be specified. See mappers/link.inc
+ *
+ * For an example implementation, see mappers/content.inc
+ *
+ * @param &$targets
+ *   Array containing the targets to be offered to the user. Add to this array
+ *   to expose additional options. Remove from this array to suppress options.
+ *   Remove with caution.
+ * @param $entity_type
+ *   The entity type of the target, for instance a 'node' entity.
+ * @param $bundle_name
+ *   The bundle name for which to alter targets.
+ */
+/*function feeds_imagegrabber_feeds_processor_targets_alter(&$targets, $entity_type, $bundle_name) {
+  if ($entity_type == 'node') {
+    $targets['my_node_field'] = array(
+      'name' => t('My custom node field'),
+      'description' => t('Description of what my custom node field does.'),
+      'callback' => 'my_module_set_target',
+    );
+    $targets['my_node_field2'] = array(
+      'name' => t('My Second custom node field'),
+      'description' => t('Description of what my second custom node field does.'),
+      'callback' => 'my_module_set_target2',
+      'real_target' => 'my_node_field_two', // Specify real target field on node.
+    );
+  }
+}*/
+
+/**
+ * tjs 2012Jan04 - 2012Jan15
+ * 
+ * Example callback specified in hook_feeds_processor_targets_alter().
+ *
+ * @param $source
+ *   Field mapper source settings.
+ * @param $entity
+ *   An entity object, for instance a node object.
+ * @param $target
+ *   A string identifying the target on the node.
+ * @param $value
+ *   The value to populate the target with.
+ *
+ */
+function my_module_set_target($source, $entity, $target, $value) {
+
+	  //list($field_name) = split(':', $target);//$source->config['FeedsHTTPFetcher']['source']x
+	  list($field_name) = explode(':', $target);//$source->config['FeedsHTTPFetcher']['source']x
+	  
+	  if($value){// if(preg_match("/scoop.it/",$source->config['FeedsHTTPFetcher']['source']))
+		  // get host name from URL
+			  if(preg_match('@^(?:http(s?)://)?([^/]+)@i',$value, $matches)){
+				  $host = $matches[count($matches)-1];//$host = $matches[1];
+				  
+				  $pos1 = stripos($value, "youtube.com");
+				  $pos2 = stripos($value, "vimeo.com");
+				  
+				  if(!$pos1 && !$pos2){
+				  	$entity->field_sourcesite['und'][0]['url'] = $host;
+				  	$entity->field_sourcesite['und'][0]['title'] = $host;// tjs 2012Jan15
+				  }
+				  else{
+				  	$entity->{$field_name}['und'][0]['video_url'] = $value;
+				  	$entity->field_sourcesite['und'][0]['url'] = $host;
+				  	$entity->field_sourcesite['und'][0]['title'] = $host; // tjs 2012Jan15
+				  }
+				  
+				  if($pos1 || $pos2){
+				  	if(isset ($entity->field_image)){ //tjs 2012Jan01
+				  		unset($entity->field_image);//$entity->field_image = '' ;
+				  	}
+				  }
+			  }//if(preg_match
+		  }//if($value)
+		  	
+		  $description = $entity->field_feed_item_description['und'][0]['value']; //tjs 2012Jan02
+		  
+		  /*****************BOINGBOING        ***********************/
+		  if($source->config['FeedsHTTPFetcher']['source'] == 'http://feeds.boingboing.net/boingboing/iBag'){
+		  	//(.*?)\s*
+		  	if(preg_match("/\<iframe(.*)iframe\>/U",$description,$embedded_contents) ||
+		  	   preg_match("/\<iframe\ssrc\=\"(.*)\"\s(.*)iframe\>/U",$description,$embedded_contents) ||
+		  	   //preg_match("/\<embed(.*)\"\>/U",$description,$embedded_contents)){
+		  	   preg_match("/\<object(.*)\<\/object\>/U",$description,$embedded_contents)){
+		  		
+		  			$newline = stripos($embedded_contents[0], "\n");
+		  		
+		  			$matches = array();
+		  					  		
+			  		if(preg_match("/src=\"(.*)\"/U",$embedded_contents[1],$matches)){
+			  			
+		  				//if there is iframe or object must be a video, so remove image as will show only video or image, not both tjs 2012Jan26
+			  			if(isset ($entity->field_image)){ //tjs 2012Jan01
+			  				unset($entity->field_image); //$entity->field_image = '' ;
+			  			}
+			  			
+			  			$pos1 = stripos($matches[1], "vimeo.com");
+			  			$pos2 = stripos($matches[1], "youtube.com");
+			  			$pos3 = strripos($matches[1], "youtube-nocookie.com");
+			  			
+			  			
+			  			if($pos1 || $pos2 || $pos3){//if pos1 searc for ? trim off everything after the '?'
+			  				
+			  				if($pos3){//Video embed field handler does not account for youtube-nocookie. tjs 2012Jan26
+			  					$video = substr_replace($matches[1], "youtube.com", $pos3, strlen("youtube-nocookie.com"));
+			  				}elseif($pos1){
+			  					
+			  					if($pos4 = stripos($matches[1], '?')){
+			  						
+			  						$before_mark = substr($matches[1], 0, $pos4);
+			  						$video = $before_mark;
+			  					}
+			  					
+			  					if($player = stripos($before_mark, 'player.')){
+			  						
+			  						$no_player = substr_replace($before_mark, '', $player, strlen("player."));//tjs 2012Feb23
+			  						$video = $no_player;
+			  					}
+			  					
+			  				}elseif($pos2){
+			  					
+			  					$video=$matches[1];
+			  				}
+			  				
+			  				
+			  				$entity->{$field_name}['und'][0]['video_url'] = $video;// Currently this field can only support youtube.com or vimeo.com
+			  				$entity->{$field_name}['und'][0]['format'] = 'embed_video';
+			  				
+			  				if(preg_match('@^(?:http(s?)://)?([^/]+)@i',$video, $matches)){// tjs 2012Jan24
+			  					$host = $matches[count($matches)-1];//get size
+			  				
+			  					$entity->field_sourcesite['und'][0]['url'] = $host;
+			  					$entity->field_sourcesite['und'][0]['title'] = $host;// tjs 2012Jan15
+			  				}
+			  				
+			  			//if($pos1 || $pos2 || $pos3))
+			  			}else{//grabbed embedded object and place in embed field tjs 2012Jan26
+			  				//<a href="http://traffic.libsyn.com/makers/maketalk_006.mp3">
+			  				$entity->field_embedvideo['und'][0]['value'] = $embedded_contents[0];
+			  				$entity->field_embedvideo['und'][0]['format'] = 'embed_video';
+			  				//get object from $description and set embed field, 'embedvideo', with that value  tjs 2012Jan26
+			  				//Set text format to 'Embed video'	
+			  				/*if(preg_match("/\<object(.*)\<\/object\>/U",$description,$embedded_video)){
+			  					$entity->field_embedvideo['und'][0]['value'] = $embedded_video;
+			  				}*/
+			  				
+			  			}
+			  			
+
+			  		}//elseif(preg_match(,$iframe_contents[1],$matches)){//value="http://www.youtube.com/v/Y3Vdiwg6c5o?version=3&amp;hl=en_US"
+			  			
+			  			
+			  		
+	  		}elseif(preg_match("/\<img\ssrc=(.*)\"/", $description, $matches)){//checking for images
+	  			$pheedo = "ads.pheedo.com";
+	  			$feedburner = "feeds.feedburner.com";
+	  			$pheedo_found = stripos($matches[0],$pheedo);
+	  			$feedburner_found = stripos($matches[0], $feedburner);
+	  			
+	  			if(!$feedburner_found && !$pheedo_found){
+		  			$src_attribute = "src=\"";
+		  			$double_quote = "\"";
+		  			$pos1 = stripos($matches[0], $src_attribute);
+		  			//$size_of_src_attribute = sizeof($src_attribute);
+		  			$offset = $pos1 + strlen($src_attribute);
+		  			$pos2 = stripos($matches[0], $double_quote, $offset);
+		  			$image_url = substr($matches[0], $offset, $pos2-$offset);  // abcdef	 
+
+		  			//preg_match to compage image_url against those in entity->field_image
+		  			//foreach($entity->field_image['und'] as $image){
+
+		  			$count = count($entity->field_image['und'])-1;
+		  			
+		  			$found_index = 0;
+		  			$found = FALSE;
+		  			for($i = 0; $i <= $count; $i++){
+		  				
+		  				$current_image = $entity->field_image['und'][$i]['filename'];
+		  				
+		  				$image_found  = stripos($image_url, $current_image );
+		  				if($image_found){
+		  					$found = TRUE;
+		  					$found_index = $i;
+		  					break;
+		  				}
+		  			}
+		  			
+		  			if($found){
+		  				
+		  				$found_image = $entity->field_image['und'][$found_index];
+		  				
+		  				unset($entity->field_image);
+		  				$entity->field_image['und'][0] = $found_image;
+		  			}
+
+		  			if(preg_match('@^(?:http(s?)://)?([^/]+)@i',$image_url, $matches)){
+		  				$host = $matches[count($matches)-1];//$host = $matches[1];	
+		  				$entity->field_sourcesite['und'][0]['url'] = $host;
+		  				$entity->field_sourcesite['und'][0]['title'] = $host;// tjs 2012Jan15
+		  			}	
+	  			}else{
+	  				
+	  				if(isset ($entity->field_image)){ //tjs 2012Jan01
+	  					//$entity->field_image = '' ;
+	  					unset($entity->field_image);
+	  				}
+	  				
+	  			}
+	  					
+		  	}else{//elseif(preg_match("/\<img\ssrc=(.*)\"/"
+		  		
+		  		if(isset ($entity->field_image)){ //tjs 2012Jan01
+		  			//$entity->field_image = '' ;
+		  			unset($entity->field_image);
+		  		}
+		  		
+		  	}
+		  	
+		  	if(preg_match("/\<a href\=\"(.*).mp3\"\>/", $description, $audio )){
+		  		
+		  		//<script type="text/javascript" src="http://player.wizzard.tv/player/o/j/x/132985323385/config/k-ee672ff4677701b5/uuid/root.m4v/height/50/width/580"></script>
+		  		if(preg_match("/\<iframe(.*)iframe\>/U",$description,$embedded_audio) ||
+		  		   preg_match("/\<object(.*)\<\/object\>/U",$description,$embedded_audio)||
+		  		   preg_match("/\<script(.*)script>/U",$description,$embedded_audio)){
+		  			
+		  			//<a href="http://traffic.libsyn.com/makers/maketalk_006.mp3">
+		  			$entity->field_embedvideo['und'][0]['value'] = $embedded_audio[0];//http://traffic.libsyn.com/makers/maketalk_006.mp3" height= "5%" width= "100%"></iframe>$audio[1] . ".mp3";
+		  			$entity->field_embedvideo['und'][0]['format'] = 'embed_video';
+		  			
+		  		}
+		  		
+
+		  		
+		  	}
+		  }//BOINGBOING
+		  
+		  
+		  
+		  /*****************SCOOP.IT        ***********************/
+		  if($source->config['FeedsHTTPFetcher']['source'] == 'http://www.scoop.it/t/new-civilizations/rss.xml'){
+
+			  if($description){
+			  	$promo = "See it on Scoop.it";
+			    $via = ", via ";
+			    $New_Civilizations = "New Civilizations";
+			    
+			    $pos = strripos($description, $promo);
+			    $description_wo_promo = substr_replace($description, ' ', $pos, strlen($promo));
+			    
+			    $pos = strripos($description_wo_promo, $via);    
+			    $description_wo_via = substr_replace($description_wo_promo, ' ', $pos, strlen($via));
+			    
+			    $pos = strripos($description_wo_via, $New_Civilizations);
+			    $description_wo_nc = substr_replace($description_wo_via, ' ', $pos, strlen($New_Civilizations));
+			    
+			    if(!preg_match("/<img\ssrc='/", $description_wo_nc)){
+					if(isset ($entity->field_image)){ //tjs 2012Jan01
+					  	//$entity->field_image = '' ;
+					  	unset($entity->field_image);
+					}
+			    }
+			    
+			    $description_wo_si = $description_wo_nc;
+			    
+			    //if(preg_match("/\<img\ssrc=\'http:\/\/img.scoop.it(.*)\'\s\/\>/", $description_wo_nc, $matches)){
+			    if(preg_match("/\<img\ssrc=\'http:\/\/img.scoop.it(.*)\'\s\/\>/", $description_wo_nc, $matches)){
+			    	$scoop_it = $matches[0];
+			    	$pos = strripos($description_wo_nc, $scoop_it);
+			    	$description_wo_si = substr_replace($description_wo_nc, '', $pos, strlen($scoop_it));
+			    }
+			    
+			    $entity->field_feed_item_description['und'][0]['value'] = $description_wo_si;
+			  }// if($description)
+	  	
+			}//SCOOP.IT
+			
+			//tumblr
+			
+			//dc_source  $item['dc_source']
+}
+
+
+/**
+ * Set a concrete target element. Invoked from FeedsProcessor::map().
+ *
+ * @ingroup mappingapi
+ */
+/*function set_video_target($source, $target_item, $target_element, $value) {
+	
+	$target_item->$target_element = $value;
+}*/
+
+
+
+/*function increase_counter($incrementor){
+	
+	if(!$tjs_counter){
+		static $tjs_counter = 0;
+	}
+	
+	return $tjs_counter++;
+	
+}*/
