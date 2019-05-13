@@ -601,8 +601,9 @@ function _add_dc_source($dc, $link = NULL, $description = NULL){
 					$return = ''; //then return nothing. We're looking for the source site of type string
 				}
 			}
-			
-		}elseif($link == "http://newciv.tumblr.com/") {// "newciv.tumblr.com")
+
+	//}elseif($link == "http://newciv.tumblr.com/") {// "newciv.tumblr.com")
+	}elseif(stripos($link, 'tumblr.com')){//made code more generic.  tjs 2019May13
 
 			if(preg_match("/\<a class\=\"tumblr_blog\"(.*)\/a\>/",$description, $matches)){
 				//if(preg_match('@^(?:http(s?)://)?([^/]+)@i',$description, $matches)){
