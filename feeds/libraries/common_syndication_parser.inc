@@ -482,7 +482,6 @@ function _parser_common_syndication_RSS20_parse($feed_XML) {
     $item['domains'] = $additional_taxonomies['RSS Domains'];
     $item['tags'] = $additional_taxonomies['RSS Categories'];
 
-    //$item['dc_source'] = _add_dc_source($dc['source'], $parsed_source['link'], $item['description']);// tjs 2012Jan15
     $item['dc_source'] = _add_dc_source($dc, $parsed_source['link'], $item['description']);// tjs 2012Jan15
    
     $parsed_source['items'][] = $item;
@@ -591,9 +590,7 @@ function _add_dc_source($dc, $link = NULL, $description = NULL){
 	
 	//find key
 	if (array_key_exists('source', $dc) && $dc['source']) {  //tjs 2012Jan14  sometimes source is missing.
-		
-		//if($dc['source']){  
-			
+
 			if(is_string($dc['source'])){
 			
 				$return = $dc['source'];  // tjs 2012Jan03 Added for the Scoop.it feed
@@ -605,8 +602,8 @@ function _add_dc_source($dc, $link = NULL, $description = NULL){
 				}
 			}
 			
-		}elseif($link == "http://newciv.tumblr.com/"){// "newciv.tumblr.com")
-			
+		}elseif($link == "http://newciv.tumblr.com/") {// "newciv.tumblr.com")
+
 			if(preg_match("/\<a class\=\"tumblr_blog\"(.*)\/a\>/",$description, $matches)){
 				//if(preg_match('@^(?:http(s?)://)?([^/]+)@i',$description, $matches)){
 				if(preg_match("/href\=\"http\:\/\/(.*)\//U",$description, $matches)){
