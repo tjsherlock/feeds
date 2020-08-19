@@ -1,6 +1,6 @@
 feeds
 =====
-The feeds project can be found at https://www.drupal.org/project/feeds
+The original, canonical feeds project can be found at https://www.drupal.org/project/feeds
 
 Here you may find several changes that I made to the original project on Drupal.org.
 
